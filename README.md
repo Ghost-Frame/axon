@@ -44,7 +44,7 @@ docker run -d -p 4600:4600 -e AXON_AUTH=disabled ghcr.io/syntheos-dev/axon:lates
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `4600` | HTTP port to listen on |
-| `DB_PATH` | `/data/axon.db` | Path to the libsql database file |
+| `DB_PATH` | `/data/axon.db` in the Docker image (the code's own fallback is `./axon.db` when run outside Docker without `DB_PATH` set) | Path to the libsql database file |
 | `AXON_API_KEY` | required | Bearer token for authenticated endpoints |
 | `AXON_AUTH` | — | Set to `disabled` to skip auth entirely |
 | `CORS_ALLOW_ORIGIN` | — | Allowed CORS origin, or `*` for all |
@@ -141,3 +141,11 @@ GET /poll?agent=myagent&channel=tasks&limit=50
 ```
 
 Returns all events in the channel since the agents last poll cursor. The cursor is stored per agent per channel and advances automatically on each call. Use this for agents that cannot hold a persistent HTTP connection.
+
+### Get Cursor Position
+
+```
+GET /cursor?agent=myagent&channel=tasks
+```
+
+Returns `{ "agent": ..., "channel": ..., "cursor": <last_event_id> }` for the given agent/channel pair without consuming events or advancing the cursor, unlike `/poll`.

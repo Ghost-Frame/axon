@@ -1,5 +1,6 @@
 import type { Db } from "./db.ts";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { safeFetch, validateUrl } from "./net.ts";
 
 // ============================================================================
 // TYPES
@@ -14,6 +15,7 @@ export interface AxonEvent {
   created_at: string;
 }
 
+// Describes one agent's channel subscription and optional delivery filters.
 export interface Subscription {
   id: number;
   agent: string;
@@ -23,6 +25,7 @@ export interface Subscription {
   created_at: string;
 }
 
+// Tracks one connected SSE consumer and its current delivery cursor.
 interface SSEClient {
   agent: string;
   channels: Set<string>;
@@ -38,12 +41,22 @@ interface SSEClient {
 const sseClients: Map<string, SSEClient> = new Map();
 let clientIdCounter = 0;
 
+// Strip CR and LF from a value destined for an SSE frame header line.
+// The publish route rejects these up front; this is the second layer, applied
+// at the sink itself so the frame stays well-formed no matter which caller
+// produced the event.
+function sseHeaderSafe(value: string): string {
+  return value.replace(/[\r\n]/g, " ");
+}
+
+// Delivers a published event to every matching connected SSE consumer.
 function broadcastToSSE(event: AxonEvent) {
   for (const [id, client] of sseClients) {
     if (!client.channels.has("*") && !client.channels.has(event.channel)) continue;
     if (client.filterType && event.type !== client.filterType) continue;
     try {
-      client.res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      client.res.write(`id: ${event.id}\nevent: ${sseHeaderSafe(event.type)}\ndata: ${JSON.stringify(event)}\n\n`);
+      client.lastEventId = event.id;
     } catch {
       sseClients.delete(id);
     }
@@ -87,13 +100,25 @@ function fanOutWebhooks(db: Db, event: AxonEvent) {
 
   for (const sub of subs) {
     if (sub.filter_type && sub.filter_type !== event.type) continue;
-    // Fire and forget
-    fetch(sub.webhook_url!, {
+    // Fire and forget. safeFetch re-resolves and revalidates the target at
+    // this moment rather than trusting the check made when the subscription
+    // was stored, which closes the DNS-rebinding window, and it revalidates
+    // each redirect hop so a public origin cannot bounce us somewhere internal.
+    safeFetch(sub.webhook_url!, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(event),
       signal: AbortSignal.timeout(5000),
-    }).catch(() => {});
+    }).catch((e) => {
+      console.error(
+        JSON.stringify({
+          msg: "axon_webhook_delivery_failed",
+          agent: sub.agent,
+          channel: sub.channel,
+          error: e instanceof Error ? e.message : String(e),
+        }),
+      );
+    });
   }
 }
 
@@ -120,6 +145,7 @@ export function getEvents(
   return rows.map(r => ({ ...r, payload: JSON.parse(r.payload) }));
 }
 
+// Retrieves one event by numeric identifier, parsing its JSON payload.
 export function getEvent(db: Db, id: number): AxonEvent | undefined {
   const row = db.prepare("SELECT * FROM events WHERE id = ?").get(id) as any;
   if (!row) return undefined;
@@ -138,6 +164,7 @@ export function listChannels(db: Db) {
   `).all();
 }
 
+// Creates a channel or updates its description and retention policy.
 export function createChannel(db: Db, name: string, description?: string, retainHours?: number) {
   return db.prepare(
     "INSERT INTO channels (name, description, retain_hours) VALUES (?, ?, ?) RETURNING *"
@@ -149,15 +176,21 @@ export function createChannel(db: Db, name: string, description?: string, retain
 // ============================================================================
 
 export function subscribe(db: Db, agent: string, channel: string, filterType?: string, webhookUrl?: string): Subscription {
+  // Reject obviously-internal targets before they are ever persisted. This is
+  // the cheap literal check; delivery re-validates with DNS resolution, since
+  // a hostname that is public now may point inward later.
+  if (webhookUrl) validateUrl(webhookUrl);
   return db.prepare(
     "INSERT INTO subscriptions (agent, channel, filter_type, webhook_url) VALUES (?, ?, ?, ?) ON CONFLICT(agent, channel) DO UPDATE SET filter_type = excluded.filter_type, webhook_url = excluded.webhook_url RETURNING *"
   ).get(agent, channel, filterType ?? null, webhookUrl ?? null) as Subscription;
 }
 
+// Removes an agent's subscription to one channel.
 export function unsubscribe(db: Db, agent: string, channel: string): boolean {
   return db.prepare("DELETE FROM subscriptions WHERE agent = ? AND channel = ?").run(agent, channel).changes > 0;
 }
 
+// Lists subscriptions, optionally limited to one agent.
 export function getSubscriptions(db: Db, agent?: string): Subscription[] {
   if (agent) {
     return db.prepare("SELECT * FROM subscriptions WHERE agent = ? ORDER BY channel").all(agent) as Subscription[];
@@ -189,11 +222,48 @@ export function poll(db: Db, agent: string, channel: string, limit: number = 50)
   return { events, cursor: events.length > 0 ? events[events.length - 1].id : sinceId };
 }
 
+// Returns an agent's current cursor position on a channel without consuming
+// events or advancing the cursor, unlike poll() which does both as a side
+// effect. Useful for a caller that wants to know how far behind it is before
+// deciding whether to poll or stream.
+export function getCursor(db: Db, agent: string, channel: string): { agent: string; channel: string; cursor: number } {
+  const row = db.prepare(
+    "SELECT last_event_id FROM cursors WHERE agent = ? AND channel = ?"
+  ).get(agent, channel) as { last_event_id: number } | undefined;
+  return { agent, channel, cursor: row?.last_event_id ?? 0 };
+}
+
 // ============================================================================
 // SSE STREAM
 // ============================================================================
 
+// Loads events published on the given channels (or every channel, if the set
+// contains the "*" wildcard) after lastEventId, respecting an optional type
+// filter. Used at SSE connect time to replay whatever a client missed while
+// disconnected, mirroring the semantics of broadcastToSSE's own filtering.
+function catchUpEvents(db: Db, channels: Set<string>, filterType: string | null, lastEventId: number): AxonEvent[] {
+  const wildcard = channels.has("*");
+  let rows: any[];
+  if (wildcard) {
+    rows = db.prepare(
+      "SELECT * FROM events WHERE id > ? ORDER BY id ASC LIMIT 1000"
+    ).all(lastEventId) as any[];
+  } else if (channels.size === 0) {
+    return [];
+  } else {
+    const list = [...channels];
+    const placeholders = list.map(() => "?").join(",");
+    rows = db.prepare(
+      `SELECT * FROM events WHERE channel IN (${placeholders}) AND id > ? ORDER BY id ASC LIMIT 1000`
+    ).all(...list, lastEventId) as any[];
+  }
+  const events = rows.map(r => ({ ...r, payload: JSON.parse(r.payload) })) as AxonEvent[];
+  return filterType ? events.filter(e => e.type === filterType) : events;
+}
+
+// Opens an SSE stream, replays missed events, and registers live delivery.
 export function startSSE(
+  db: Db,
   req: IncomingMessage,
   res: ServerResponse,
   agent: string,
@@ -210,12 +280,34 @@ export function startSSE(
   res.write(":ok\n\n");
 
   const clientId = `sse-${++clientIdCounter}`;
+  const channelSet = new Set(channels);
+  let trackedLastId = lastEventId ?? 0;
+
+  // Replay whatever was published while this client was disconnected before
+  // it joins the live broadcast below. Because this whole block runs
+  // synchronously (no await), nothing else can publish in between the query
+  // and the client being registered in sseClients, so there is no gap for an
+  // event to be either lost or delivered twice.
+  if (lastEventId !== undefined && lastEventId > 0) {
+    const missed = catchUpEvents(db, channelSet, filterType ?? null, lastEventId);
+    for (const event of missed) {
+      try {
+        res.write(`id: ${event.id}\nevent: ${sseHeaderSafe(event.type)}\ndata: ${JSON.stringify(event)}\n\n`);
+        trackedLastId = event.id;
+      } catch {
+        // Connection died mid-replay; the "close" handler registered below
+        // will still fire and clean up sseClients once this function returns.
+        break;
+      }
+    }
+  }
+
   const client: SSEClient = {
     agent,
-    channels: new Set(channels),
+    channels: channelSet,
     filterType: filterType ?? null,
     res,
-    lastEventId: lastEventId ?? 0,
+    lastEventId: trackedLastId,
   };
   sseClients.set(clientId, client);
 
@@ -232,18 +324,36 @@ export function startSSE(
 // MAINTENANCE
 // ============================================================================
 
+// Default retention window (7 days) applied to a channel that has events but
+// no row in `channels` -- mirrors the schema's own DEFAULT for retain_hours.
+const DEFAULT_RETAIN_HOURS = 168;
+
+// Deletes events older than their channel's retention window. publish() never
+// requires a channel to be registered in `channels`, so events on an ad-hoc
+// channel would never match the old channel-table-driven loop and would grow
+// unbounded. This instead enumerates every channel that actually has events,
+// falling back to DEFAULT_RETAIN_HOURS for any that lack a `channels` row.
 export function pruneEvents(db: Db) {
-  const channels = db.prepare("SELECT name, retain_hours FROM channels").all() as Array<{ name: string; retain_hours: number }>;
+  const configured = new Map<string, number>();
+  for (const ch of db.prepare("SELECT name, retain_hours FROM channels").all() as Array<{ name: string; retain_hours: number }>) {
+    configured.set(ch.name, ch.retain_hours);
+  }
+
+  const eventChannels = (db.prepare("SELECT DISTINCT channel FROM events").all() as Array<{ channel: string }>)
+    .map(r => r.channel);
+
   let total = 0;
-  for (const ch of channels) {
+  for (const channel of eventChannels) {
+    const retainHours = configured.get(channel) ?? DEFAULT_RETAIN_HOURS;
     const result = db.prepare(
       "DELETE FROM events WHERE channel = ? AND created_at < datetime('now', ?)"
-    ).run(ch.name, `-${ch.retain_hours} hours`);
+    ).run(channel, `-${retainHours} hours`);
     total += result.changes;
   }
   return total;
 }
 
+// Returns aggregate event, channel, subscription, and cursor counts.
 export function getStats(db: Db) {
   const eventCount = (db.prepare("SELECT COUNT(*) as c FROM events").get() as any).c;
   const channelCount = (db.prepare("SELECT COUNT(*) as c FROM channels").get() as any).c;
